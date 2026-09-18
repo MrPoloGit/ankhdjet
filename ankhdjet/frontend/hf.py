@@ -32,6 +32,15 @@ llama-family module naming shared by the known ternary releases
 Plus a final lm_head (vocab projection). Attention compute itself
 (softmax(QK^T/sqrt(d))V) is NOT a LINEAR layer and is handled separately
 by a fixed-function ATTENTION_BLOCK in the area model.
+
+Hybrid-attention configs (the Qwen3.5/3.6 family and its ternary
+derivatives) name each block's type in `layer_types`; a linear-attention
+block (gated delta rule) carries its projections under linear_attn:
+  in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj
+and keeps a fixed recurrent state per stream instead of a KV cache. A
+multimodal wrapper nests the language model's config under `text_config`
+and its tensors under model.language_model; the vision tower is not
+ternary and is not part of the IR.
 """
 
 from __future__ import annotations
@@ -49,7 +58,10 @@ from ankhdjet.frontend.ir import (
 
 @dataclass
 class TransformerArch:
-    """Subset of llama-family config.json fields used to build the IR."""
+    """Subset of llama-family config.json fields used to build the IR,
+    with the hybrid-attention fields of the Qwen3.5-class configs: the
+    per-block layer types, the linear-attention head geometry, and the
+    output gate that doubles q_proj."""
     hidden_size: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -59,6 +71,13 @@ class TransformerArch:
     vocab_size: int
     max_position_embeddings: int
     name: str = "model"
+    layer_types: tuple = ()          # per block: "full_attention" or "linear_attention"; empty = all full
+    linear_num_key_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_num_value_heads: int = 0
+    linear_value_head_dim: int = 0
+    attn_output_gate: bool = False   # q_proj also emits a per-head gate: twice the columns
+    hf_prefix: str = "model"         # module path of the language model in the safetensors
 
     @property
     def kv_dim(self) -> int:
@@ -67,6 +86,32 @@ class TransformerArch:
     @property
     def qkv_dim(self) -> int:
         return self.num_attention_heads * self.head_dim
+
+    @property
+    def q_out_dim(self) -> int:
+        return self.qkv_dim * (2 if self.attn_output_gate else 1)
+
+    def layer_type(self, b: int) -> str:
+        return self.layer_types[b] if self.layer_types else "full_attention"
+
+    @property
+    def n_full_attention_layers(self) -> int:
+        """blocks with a KV cache"""
+        return sum(1 for b in range(self.num_hidden_layers) if self.layer_type(b) == "full_attention")
+
+    @property
+    def n_linear_attention_layers(self) -> int:
+        return self.num_hidden_layers - self.n_full_attention_layers
+
+    @property
+    def linear_state_values(self) -> int:
+        """the recurrent state a stream keeps across the linear-attention
+        blocks: one key-dim x value-dim matrix per value head per block,
+        plus the short convolution window over the qkv projection"""
+        per_block = (self.linear_num_value_heads * self.linear_key_head_dim * self.linear_value_head_dim
+                     + 4 * (2 * self.linear_num_key_heads * self.linear_key_head_dim
+                            + self.linear_num_value_heads * self.linear_value_head_dim))
+        return self.n_linear_attention_layers * per_block
 
 
 def _fetch_config(repo_id: str) -> dict:
@@ -77,12 +122,30 @@ def _fetch_config(repo_id: str) -> dict:
 
 
 def parse_hf_config(cfg: dict, name: str = "model") -> TransformerArch:
+    prefix = "model"
+    if isinstance(cfg.get("text_config"), dict):
+        cfg = cfg["text_config"]
+        prefix = "model.language_model"
     head_dim = cfg.get("head_dim")
     if head_dim is None:
         head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
+    n_layers = cfg["num_hidden_layers"]
+    layer_types = tuple(cfg.get("layer_types") or ())
+    if not layer_types and cfg.get("full_attention_interval"):
+        k = int(cfg["full_attention_interval"])
+        layer_types = tuple("full_attention" if (i + 1) % k == 0 else "linear_attention" for i in range(n_layers))
+    if layer_types and len(layer_types) != n_layers:
+        raise ValueError(f"{name}: layer_types names {len(layer_types)} blocks, config has {n_layers}")
+    unknown = sorted(set(layer_types) - {"full_attention", "linear_attention"})
+    if unknown:
+        raise ValueError(f"{name}: block types {unknown} have no projection map in the frontend")
+    linear = {k: int(cfg.get(k, 0)) for k in ("linear_num_key_heads", "linear_key_head_dim",
+                                                "linear_num_value_heads", "linear_value_head_dim")}
+    if "linear_attention" in layer_types and not all(linear.values()):
+        raise ValueError(f"{name}: linear-attention blocks without their head geometry in the config")
     return TransformerArch(
         hidden_size=cfg["hidden_size"],
-        num_hidden_layers=cfg["num_hidden_layers"],
+        num_hidden_layers=n_layers,
         num_attention_heads=cfg["num_attention_heads"],
         head_dim=head_dim,
         num_key_value_heads=cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
@@ -90,7 +153,44 @@ def parse_hf_config(cfg: dict, name: str = "model") -> TransformerArch:
         vocab_size=cfg["vocab_size"],
         max_position_embeddings=cfg.get("max_position_embeddings", 4096),
         name=name,
+        layer_types=layer_types,
+        attn_output_gate=bool(cfg.get("attn_output_gate", False)),
+        hf_prefix=prefix,
+        **linear,
     )
+
+
+def block_projections(arch: TransformerArch, b: int) -> list[tuple[str, str, int, int]]:
+    """The matmul-resident projections of block `b`: (IR layer name, the
+    module path in the checkpoint, input_dim, output_dim). A full-attention
+    block has q, k, v, o; a linear-attention block has the joined q/k/v
+    projection, the gate z, the decay a and b, and the output projection;
+    both have the gated MLP."""
+    h, ff = arch.hidden_size, arch.intermediate_size
+    base = f"{arch.hf_prefix}.layers.{b}"
+    if arch.layer_type(b) == "linear_attention":
+        kd = arch.linear_num_key_heads * arch.linear_key_head_dim
+        vd = arch.linear_num_value_heads * arch.linear_value_head_dim
+        rows = [
+            (f"b{b}_qkv", f"{base}.linear_attn.in_proj_qkv", h, 2 * kd + vd),
+            (f"b{b}_z",   f"{base}.linear_attn.in_proj_z", h, vd),
+            (f"b{b}_a",   f"{base}.linear_attn.in_proj_a", h, arch.linear_num_value_heads),
+            (f"b{b}_b",   f"{base}.linear_attn.in_proj_b", h, arch.linear_num_value_heads),
+            (f"b{b}_o",   f"{base}.linear_attn.out_proj", vd, h),
+        ]
+    else:
+        rows = [
+            (f"b{b}_q", f"{base}.self_attn.q_proj", h, arch.q_out_dim),
+            (f"b{b}_k", f"{base}.self_attn.k_proj", h, arch.kv_dim),      # GQA: K only num_key_value_heads * head_dim
+            (f"b{b}_v", f"{base}.self_attn.v_proj", h, arch.kv_dim),
+            (f"b{b}_o", f"{base}.self_attn.o_proj", arch.qkv_dim, h),
+        ]
+    rows += [
+        (f"b{b}_gate", f"{base}.mlp.gate_proj", h, ff),
+        (f"b{b}_up",   f"{base}.mlp.up_proj", h, ff),
+        (f"b{b}_down", f"{base}.mlp.down_proj", ff, h),
+    ]
+    return rows
 
 
 def _zero_weight() -> WeightTensor:
@@ -115,15 +215,10 @@ def _warn_placeholder(layer_name: str, why: str) -> None:
 
 
 def build_ir_from_arch(arch: TransformerArch) -> ModelIR:
-    """Construct a ModelIR with the matmul-resident LINEAR layers per block:
-       q_proj, k_proj, v_proj (with GQA -> kv_dim, not full hidden),
-       o_proj, gate_proj, up_proj, down_proj.
-    Plus a final lm_head. Attention compute is handled separately."""
+    """Construct a ModelIR with the matmul-resident LINEAR layers of every
+    block (see block_projections) plus a final lm_head. Attention compute
+    is handled separately."""
     layers: list[Layer] = []
-    h = arch.hidden_size
-    qkv = arch.qkv_dim
-    kv = arch.kv_dim
-    ff = arch.intermediate_size
 
     def add(lname: str, n: int, m: int) -> None:
         layers.append(Layer(
@@ -133,14 +228,9 @@ def build_ir_from_arch(arch: TransformerArch) -> ModelIR:
         ))
 
     for b in range(arch.num_hidden_layers):
-        add(f"b{b}_q",     h, qkv)
-        add(f"b{b}_k",     h, kv)         # GQA: K only num_key_value_heads * head_dim
-        add(f"b{b}_v",     h, kv)
-        add(f"b{b}_o",     qkv, h)
-        add(f"b{b}_gate",  h, ff)
-        add(f"b{b}_up",    h, ff)
-        add(f"b{b}_down",  ff, h)
-    add("lm_head", h, arch.vocab_size)
+        for lname, _, n, m in block_projections(arch, b):
+            add(lname, n, m)
+    add("lm_head", arch.hidden_size, arch.vocab_size)
 
     return ModelIR(name=arch.name, layers=layers)
 
@@ -278,23 +368,12 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
     by_name = {l.name: l for l in model.layers}
 
     # Map IR layer names back to the HF parameter prefixes so we can pull
-    # the right stored weight + scale for each.
-    # HF naming: model.layers.<i>.{self_attn,mlp}.<proj>.weight (+ .weight_scale)
+    # the right stored weight + scale for each: <module path>.weight
+    # (+ .weight_scale), the module paths from block_projections.
     layer_to_hf: dict[str, tuple[str, int, int]] = {}
     for b in range(arch.num_hidden_layers):
-        for proj, (n, m) in [
-            (f"b{b}_q",    (arch.hidden_size, arch.qkv_dim)),
-            (f"b{b}_k",    (arch.hidden_size, arch.kv_dim)),
-            (f"b{b}_v",    (arch.hidden_size, arch.kv_dim)),
-            (f"b{b}_o",    (arch.qkv_dim, arch.hidden_size)),
-            (f"b{b}_gate", (arch.hidden_size, arch.intermediate_size)),
-            (f"b{b}_up",   (arch.hidden_size, arch.intermediate_size)),
-            (f"b{b}_down", (arch.intermediate_size, arch.hidden_size)),
-        ]:
-            tag = proj.split("_", 1)[1]
-            sub = "self_attn" if tag in ("q", "k", "v", "o") else "mlp"
-            hf_proj = f"{tag}_proj"
-            layer_to_hf[proj] = (f"model.layers.{b}.{sub}.{hf_proj}", n, m)
+        for lname, path, n, m in block_projections(arch, b):
+            layer_to_hf[lname] = (path, n, m)
     layer_to_hf["lm_head"] = ("lm_head", arch.hidden_size, arch.vocab_size)
 
     scales: dict[str, float] = {}
@@ -314,8 +393,7 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
     if missing:
         raise RuntimeError(
             f"{repo_id}: {len(missing)} projection tensors not found under "
-            f"llama-family naming (first: {missing[0]}); this architecture "
-            f"is outside the frontend's naming map")
+            f"the frontend's naming map (first: {missing[0]})")
 
     n_done = 0
     n_total = len(layer_to_hf)
@@ -327,10 +405,10 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
             # the head is aliased at runtime and never stored; keep a
             # placeholder since the area model only reads dimensions.
             if ir_name == "lm_head" and arch.vocab_size:
-                alt = "model.embed_tokens.weight"
+                alt = f"{arch.hf_prefix}.embed_tokens.weight"
                 if alt in name_to_file:
                     weight_key = alt
-                    scale_key = "model.embed_tokens.weight_scale"
+                    scale_key = f"{arch.hf_prefix}.embed_tokens.weight_scale"
             if weight_key not in name_to_file:
                 _warn_placeholder(ir_name, "not stored in safetensors (tied)")
                 scales[ir_name] = 1.0

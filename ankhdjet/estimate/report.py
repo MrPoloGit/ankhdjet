@@ -88,16 +88,22 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  head_dim          = {arch.head_dim}")
     print(f"  intermediate_size = {arch.intermediate_size}")
     print(f"  vocab_size        = {arch.vocab_size}")
+    if arch.layer_types:
+        print(f"  attention         = hybrid: {arch.n_full_attention_layers} full-attention blocks with a KV cache, "
+              f"{arch.n_linear_attention_layers} linear-attention blocks with a fixed recurrent state")
     print(f"  ternary fabric weights = {fabric_params/1e9:.3f} B (mask-programmed on CiROM)")
 
+    # one byte per cached element; only the full-attention blocks keep a cache
     kv_bytes_per_tok = (
-        arch.num_hidden_layers * arch.num_key_value_heads * 2 * arch.head_dim * 1
+        arch.n_full_attention_layers * arch.num_key_value_heads * 2 * arch.head_dim * 1
     )
+    state_bytes = arch.linear_state_values
 
     print(f"\nTarget: {pdk.name} {pdk.process_nm:.0f} nm, "
           f"die budget {args.die_budget_mm2:.0f} mm^2, "
           f"KV context {args.kv_context} tokens "
-          f"({kv_bytes_per_tok * args.kv_context / 1e6:.1f} MB)")
+          f"({kv_bytes_per_tok * args.kv_context / 1e6:.1f} MB"
+          + (f" + {state_bytes / 1e6:.1f} MB recurrent state" if state_bytes else "") + ")")
 
     # First-principles tile_cols selection: pick the smallest that fits
     # the die budget at the mid alpha bracket (more tiles = more
@@ -124,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             n_transformer_blocks=arch.num_hidden_layers,
             biroma=args.biroma,
             off_fabric_layers=off_fabric,
+            state_bytes=state_bytes,
         )
         if chosen_r is None:
             chosen_tc, chosen_r = tc, r  # minimum-area configuration
@@ -146,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             n_heads=arch.num_attention_heads,
             n_transformer_blocks=arch.num_hidden_layers,
             biroma=args.biroma,
+            state_bytes=state_bytes,
         ))
     tps_sorted = sorted(r.tokens_per_second for r in rs)
     r_mid = rs[1]
@@ -162,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
           f"({100*r_mid.cells_subtotal_um2/r_mid.total_um2:.1f}%)")
     print(f"  Peripherals            : {r_mid.peripherals_subtotal_um2/1e6:>8.2f}  "
           f"({100*r_mid.peripherals_subtotal_um2/r_mid.total_um2:.1f}%)")
-    print(f"  KV cache SRAM          : {r_mid.kv_cache_um2/1e6:>8.2f}  "
+    print(f"  {'KV cache + state SRAM' if state_bytes else 'KV cache SRAM'}  : {r_mid.kv_cache_um2/1e6:>8.2f}  "
           f"({100*r_mid.kv_cache_um2/r_mid.total_um2:.1f}%)")
     print(f"  Attention engine       : {r_mid.attention_um2/1e6:>8.2f}  "
           f"({100*r_mid.attention_um2/r_mid.total_um2:.1f}%)")

@@ -103,3 +103,81 @@ def test_group_scaled_ternary_is_diagnosed_not_decoded():
 def test_gaussian_tensor_is_not_group_ternary():
     rng = np.random.default_rng(12)
     assert not is_group_ternary(rng.normal(size=(16, 512)).astype(np.float32))
+
+
+def _qwen36_27b_config() -> dict:
+    """The Qwen3.6-27B config, as its ternary derivatives keep it: the
+    language model nested under text_config, 64 blocks of which every
+    fourth is full attention and the rest gated-delta linear attention."""
+    return {
+        "architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
+        "vision_config": {"depth": 27, "hidden_size": 1152},
+        "text_config": {
+            "model_type": "qwen3_5_text", "hidden_size": 5120, "intermediate_size": 17408,
+            "num_hidden_layers": 64, "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+            "attn_output_gate": True, "full_attention_interval": 4,
+            "layer_types": ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(64)],
+            "linear_num_key_heads": 16, "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4,
+            "vocab_size": 248320, "max_position_embeddings": 262144,
+        },
+    }
+
+
+def test_hybrid_attention_config_builds_the_checkpoint_shapes():
+    """Every projection of a hybrid-attention config lands in the IR at the
+    shape the checkpoint stores it (the Qwen3.6-27B safetensors index): the
+    gated q_proj at twice the head columns, the joined
+    q/k/v projection of a linear block, its gate, decay and output projections;
+    only the full-attention blocks count toward the KV cache."""
+    from ankhdjet.frontend.hf import parse_hf_config, build_ir_from_arch, block_projections
+    arch = parse_hf_config(_qwen36_27b_config(), name="qwen36_27b")
+    assert arch.hf_prefix == "model.language_model" and arch.num_hidden_layers == 64
+    assert arch.n_full_attention_layers == 16 and arch.n_linear_attention_layers == 48
+    assert arch.layer_type(3) == "full_attention" and arch.layer_type(0) == "linear_attention"
+    full = {name: (path, n, m) for name, path, n, m in block_projections(arch, 3)}
+    assert full["b3_q"] == ("model.language_model.layers.3.self_attn.q_proj", 5120, 12288)
+    assert full["b3_k"][1:] == (5120, 1024) and full["b3_v"][1:] == (5120, 1024)
+    assert full["b3_o"] == ("model.language_model.layers.3.self_attn.o_proj", 6144, 5120)
+    lin = {name: (path, n, m) for name, path, n, m in block_projections(arch, 0)}
+    assert lin["b0_qkv"] == ("model.language_model.layers.0.linear_attn.in_proj_qkv", 5120, 10240)
+    assert lin["b0_z"][1:] == (5120, 6144) and lin["b0_a"][1:] == (5120, 48) and lin["b0_b"][1:] == (5120, 48)
+    assert lin["b0_o"] == ("model.language_model.layers.0.linear_attn.out_proj", 6144, 5120)
+    assert lin["b0_down"] == ("model.language_model.layers.0.mlp.down_proj", 17408, 5120)
+    ir = build_ir_from_arch(arch)
+    assert len(ir.layers) == 48 * 8 + 16 * 7 + 1
+    backbone = sum(l.input_dim * l.output_dim for l in ir.layers if l.name != "lm_head")
+    assert backbone == 48 * (5120 * (10240 + 6144 + 48 + 48) + 6144 * 5120 + 3 * 5120 * 17408) \
+        + 16 * (5120 * (12288 + 1024 + 1024) + 6144 * 5120 + 3 * 5120 * 17408)
+    assert 24.3e9 < backbone < 24.4e9
+    assert arch.linear_state_values == 48 * (48 * 128 * 128 + 4 * 10240)
+
+
+def test_hybrid_config_refusals_and_interval_fallback():
+    from ankhdjet.frontend.hf import parse_hf_config
+    cfg = _qwen36_27b_config()
+    cfg["text_config"].pop("layer_types")            # the interval alone names the pattern
+    arch = parse_hf_config(cfg)
+    assert arch.n_full_attention_layers == 16 and arch.layer_type(7) == "full_attention"
+    bad = _qwen36_27b_config(); bad["text_config"]["layer_types"][0] = "sliding_attention"
+    with pytest.raises(ValueError, match="sliding_attention"):
+        parse_hf_config(bad)
+    bad = _qwen36_27b_config(); bad["text_config"].pop("linear_num_value_heads")
+    with pytest.raises(ValueError, match="head geometry"):
+        parse_hf_config(bad)
+
+
+def test_llama_family_config_is_unchanged():
+    """A llama-family config keeps its projection names, shapes, module
+    paths and KV accounting: every block has a cache, no state."""
+    from ankhdjet.frontend.hf import parse_hf_config, build_ir_from_arch, block_projections
+    cfg = {"hidden_size": 2560, "intermediate_size": 6912, "num_hidden_layers": 30, "num_attention_heads": 20,
+           "num_key_value_heads": 5, "vocab_size": 128256, "max_position_embeddings": 4096}
+    arch = parse_hf_config(cfg, name="bitnet")
+    assert arch.hf_prefix == "model" and not arch.layer_types and arch.n_full_attention_layers == 30
+    assert arch.linear_state_values == 0 and arch.q_out_dim == 2560 and arch.head_dim == 128
+    rows = block_projections(arch, 2)
+    assert [r[0] for r in rows] == ["b2_q", "b2_k", "b2_v", "b2_o", "b2_gate", "b2_up", "b2_down"]
+    assert rows[0][1] == "model.layers.2.self_attn.q_proj" and rows[1][2:] == (2560, 640) and rows[6][2:] == (6912, 2560)
+    ir = build_ir_from_arch(arch)
+    assert len(ir.layers) == 30 * 7 + 1 and ir.layers[-1].name == "lm_head"

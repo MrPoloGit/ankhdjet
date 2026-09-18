@@ -390,6 +390,7 @@ def estimate_pipeline(
     n_transformer_blocks: int = 0,
     biroma: bool = False,
     off_fabric_layers: tuple[str, ...] = (),
+    state_bytes: int = 0,
 ) -> PipelineAreaReport:
     """Full pipeline area breakdown.
 
@@ -409,6 +410,9 @@ def estimate_pipeline(
             parameter counts are recorded separately in the report, matching
             the compiler emitter's skip_layers so the two agree on what is
             actually hardwired.
+        state_bytes: per-stream state that does not grow with the context
+            (the recurrent state of linear-attention blocks), kept in the
+            same SRAM as the KV cache.
     """
     fabric_layers = [l for l in model.layers if l.name not in off_fabric_layers]
     off_fabric_params = sum(
@@ -487,7 +491,7 @@ def estimate_pipeline(
         attn_per_stage = 0
     attn_total_seq = attn_per_stage * L
 
-    kv_bits = kv_context_tokens * kv_bytes_per_token * 8
+    kv_bits = (kv_context_tokens * kv_bytes_per_token + state_bytes) * 8
     kv_um2 = kv_bits * pdk.sram_um2_per_bit
 
     attention_um2 = float(attn_engine.area_um2) if attn_engine is not None else 0.0

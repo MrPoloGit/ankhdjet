@@ -48,8 +48,9 @@ def compile_for_pdk(pdk: PDK, model, arch, kv_context: int,
                      biroma: bool = False, readout: str = "analog") -> dict | None:
     biroma = biroma_applies(pdk, biroma)
     kv_bytes_per_tok = (
-        arch.num_hidden_layers * arch.num_key_value_heads * 2 * arch.head_dim
+        arch.n_full_attention_layers * arch.num_key_value_heads * 2 * arch.head_dim
     )
+    state_bytes = arch.linear_state_values
     p_mid = apply_bracket(pdk, cal, "mid")
 
     chosen_tc = None
@@ -61,7 +62,7 @@ def compile_for_pdk(pdk: PDK, model, arch, kv_context: int,
             tile_cols=tc, pipelined=True,
             head_dim=arch.head_dim, n_heads=arch.num_attention_heads,
             n_transformer_blocks=arch.num_hidden_layers,
-            biroma=biroma,
+            biroma=biroma, state_bytes=state_bytes,
         )
         if r.total_mm2 <= die_budget_mm2:
             chosen_tc = tc
@@ -78,7 +79,7 @@ def compile_for_pdk(pdk: PDK, model, arch, kv_context: int,
             tile_cols=chosen_tc, pipelined=True,
             head_dim=arch.head_dim, n_heads=arch.num_attention_heads,
             n_transformer_blocks=arch.num_hidden_layers,
-            biroma=biroma,
+            biroma=biroma, state_bytes=state_bytes,
         ))
     tps = sorted(r.tokens_per_second for r in rs)
     r_mid = rs[1]
