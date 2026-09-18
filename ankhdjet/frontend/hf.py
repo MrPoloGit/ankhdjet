@@ -472,7 +472,7 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
             W_out_in, embedded_scale = decoded
             # Stored layout is (out_features, in_features); transpose to
             # the IR convention (input_dim, output_dim).
-            W = W_out_in.T.astype(np.int64)
+            W = np.ascontiguousarray(W_out_in.T, dtype=np.int8)     # one byte per weight
             if W.shape != (n, m):
                 raise RuntimeError(
                     f"{ir_name}: decoded shape {W.shape} != expected "
