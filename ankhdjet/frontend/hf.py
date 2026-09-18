@@ -19,6 +19,11 @@ Weight storage formats, detected per tensor:
   - ternary-valued float (bf16/fp16/fp32 storing exactly {-s, 0, +s},
     the unpacked convention of TriLM-class releases): sign() recovers
     the weights and s is the embedded scale
+  - group-scaled ternary float (every run of G input positions of a row
+    holds {-s_g, 0, +s_g} with its own s_g; the unpacked convention of the
+    Bonsai-class releases, G = 128): sign() recovers the weights and the
+    per-group scales stay on the tensor as an (input groups x outputs)
+    array, since a per-tensor scale cannot carry them
   - anything else is refused as non-ternary; for checkpoints that store
     QAT master weights (quantized at inference time), pass
     quantize="absmean" to apply the b1.58 transform
@@ -293,6 +298,32 @@ def decode_ternary(raw: np.ndarray) -> tuple[np.ndarray, float] | None:
     return np.sign(raw).astype(np.int8), scales.pop()
 
 
+GROUP_SIZES = (256, 128, 64, 32)     # candidate group lengths, largest first
+
+
+def decode_group_ternary(raw: np.ndarray, groups: tuple = GROUP_SIZES
+                         ) -> tuple[np.ndarray, np.ndarray, int] | None:
+    """Decode a (out_features, in_features) float tensor stored as
+    group-scaled ternary into (ternary int8 array, scales (out, in/G) float32,
+    G), or None. A group is consistent when every nonzero of each run of G
+    input positions has one magnitude; the largest consistent candidate is
+    the checkpoint's group (a run consistent at G is also consistent at every
+    divisor of G). An all-zero group has scale 0."""
+    if raw.dtype == np.uint8 or raw.ndim != 2:
+        return None
+    x = np.asarray(raw, dtype=np.float32)
+    n_out, n_in = x.shape
+    mag = np.abs(x)
+    for g in groups:
+        if n_in % g:
+            continue
+        blk = mag.reshape(n_out, n_in // g, g)
+        s = blk.max(axis=2)
+        if np.all((blk == s[:, :, None]) | (blk == 0)):
+            return np.sign(x).astype(np.int8), s.astype(np.float32), g
+    return None
+
+
 def is_group_ternary(raw: np.ndarray, group: int = 128,
                      sample_rows: int = 8) -> bool:
     """Sampled test for group-scaled ternary storage: every length-`group`
@@ -422,17 +453,18 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
             else:
                 raw = t.to(dtype=torch.float32).cpu().numpy()
             decoded = decode_ternary(raw)
+            group_scale = None
+            if decoded is None:
+                grouped = decode_group_ternary(raw)
+                if grouped is not None:
+                    W_g, s_g, _ = grouped
+                    decoded, group_scale = (W_g, 1.0), s_g.T        # (input groups, outputs)
             if decoded is None and quantize == "absmean":
                 decoded = absmean_quantize(raw)
             if decoded is None:
-                if is_group_ternary(raw):
-                    why = (f"stored as group-scaled ternary ({t.dtype}); "
-                           f"the sign mask is recoverable but per-tensor "
-                           f"requantize cannot carry per-group scales")
-                else:
-                    why = (f"stored non-ternary ({t.dtype}); pass "
-                           f"quantize='absmean' if this checkpoint holds "
-                           f"QAT master weights")
+                why = (f"stored non-ternary ({t.dtype}); pass "
+                       f"quantize='absmean' if this checkpoint holds "
+                       f"QAT master weights")
                 _warn_placeholder(ir_name, why)
                 scales[ir_name] = 1.0
                 n_done += 1
@@ -458,6 +490,7 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
         layer = by_name[ir_name]
         layer.weights["weight"] = WeightTensor(
             name="weight", data=W, scheme=QuantScheme.TERNARY,
+            scale=group_scale,
         )
 
         n_done += 1

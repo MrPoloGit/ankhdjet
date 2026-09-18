@@ -181,3 +181,40 @@ def test_llama_family_config_is_unchanged():
     assert rows[0][1] == "model.layers.2.self_attn.q_proj" and rows[1][2:] == (2560, 640) and rows[6][2:] == (6912, 2560)
     ir = build_ir_from_arch(arch)
     assert len(ir.layers) == 30 * 7 + 1 and ir.layers[-1].name == "lm_head"
+
+
+def test_group_scaled_ternary_decodes_with_its_group():
+    """A tensor whose rows hold {-s_g, 0, +s_g} per run of 128 inputs decodes
+    to its sign mask and an (out, in/128) scale array, the group found as the
+    largest consistent candidate; a tensor with one scale per 64 is found at
+    64; a tensor whose magnitudes differ inside every run is refused."""
+    from ankhdjet.frontend.hf import decode_group_ternary
+    rng = np.random.default_rng(21)
+    signs = rng.choice([-1, 0, 1], size=(6, 512)).astype(np.float32)
+    s128 = rng.uniform(0.005, 0.02, size=(6, 4)).astype(np.float32)
+    raw = signs * np.repeat(s128, 128, axis=1)
+    W, s, g = decode_group_ternary(raw)
+    assert g == 128 and np.array_equal(W, signs.astype(np.int8))
+    assert s.shape == (6, 4) and np.allclose(s, s128)
+    s64 = rng.uniform(0.005, 0.02, size=(6, 8)).astype(np.float32)
+    W, s, g = decode_group_ternary(signs * np.repeat(s64, 64, axis=1))
+    assert g == 64 and s.shape == (6, 8) and np.allclose(s, s64)
+    # an all-zero run carries scale 0 and stays consistent
+    raw[2, 128:256] = 0
+    W, s, g = decode_group_ternary(raw)
+    assert g == 128 and s[2, 1] == 0 and not W[2, 128:256].any()
+    assert decode_group_ternary(rng.normal(size=(6, 512)).astype(np.float32)) is None
+    assert decode_group_ternary(_pack(signs[:4].astype(np.int8))) is None        # packed storage is the other ladder rung
+    assert decode_group_ternary(raw[:, :500]) is None                          # no candidate divides the width
+
+
+def test_group_scaled_real_row_from_the_qwen36_release():
+    """A real k_proj row of a group-scaled ternary release, if its checkpoint
+    tensor was fetched into the scratchpad, decodes at group 128."""
+    import os
+    p = Path(os.environ.get("ANKHDJET_SCRATCH", "")) / "kproj_l3.npy"
+    if not p.exists():
+        pytest.skip("no fetched tensor")
+    from ankhdjet.frontend.hf import decode_group_ternary
+    W, s, g = decode_group_ternary(np.load(p))
+    assert g == 128 and W.shape == (1024, 5120) and s.shape == (1024, 40) and (s > 0).all()
