@@ -50,11 +50,45 @@ def emit_wmat(W: np.ndarray, path: str | Path) -> Path:
 
 
 def emit_layer_wmat(layer: Layer, path: str | Path) -> Path:
-    """Emit one IR LINEAR layer's ternary weight matrix as a .wmat file."""
+    """Emit one IR LINEAR layer's weight matrix as a .wmat file.
+
+    TERNARY emits as-is. BINARY sign-maps {0,1} -> {-1,+1}: a binary
+    cell never floats a drain (always BL+ or BL-), a strict subset of
+    the ternary mask vocabulary, so this covers the row/per-tensor
+    granularity case unmodified -- not the general sub-row
+    group-granularity affine case, which needs new per-group
+    periphery. See docs/binary_and_matmulfree_investigation.md.
+    """
     wt = layer.weights["weight"]
-    if wt.scheme != QuantScheme.TERNARY:
-        raise ValueError(f"layer {layer.name}: expected ternary, got {wt.scheme}")
-    return emit_wmat(wt.data, path)
+    if wt.scheme == QuantScheme.BINARY:
+        W = np.asarray(wt.data, dtype=np.int8) * 2 - 1   # {0,1} -> {-1,+1}
+    elif wt.scheme == QuantScheme.TERNARY:
+        W = wt.data
+    else:
+        raise ValueError(f"layer {layer.name}: expected ternary or binary, got {wt.scheme}")
+    return emit_wmat(W, path)
+
+
+def save_scale_bias(wt, out_dir: str | Path) -> str | None:
+    """Persist a layer's per-group scale/bias arrays as
+    `<out_dir>/scale_bias.npz`. Closes a gap that predated BINARY:
+    group-scaled ternary (decode_group_ternary) already carries an
+    array-valued `WeightTensor.scale`, but nothing downstream of the IR
+    persisted it anywhere -- it was computed, then dropped on the
+    floor. Returns the written filename, or None if `wt.scale` is not
+    array-valued and `wt.bias` is absent (a plain per-tensor float
+    scale needs no sibling file)."""
+    arrays = {}
+    if isinstance(wt.scale, np.ndarray):
+        arrays["scale"] = wt.scale
+    if wt.bias is not None:
+        arrays["bias"] = np.asarray(wt.bias)
+    if not arrays:
+        return None
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    np.savez(out / "scale_bias.npz", **arrays)
+    return "scale_bias.npz"
 
 
 def load_wmat(path: str | Path) -> np.ndarray:

@@ -347,6 +347,80 @@ def is_group_ternary(raw: np.ndarray, group: int = 128,
     return True
 
 
+def decode_binary_affine(raw: np.ndarray, groups: tuple = GROUP_SIZES
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
+    """Decode a (out_features, in_features) float tensor stored as
+    group-scaled affine binary into (sign mask int8 {0,1}, scale
+    (out, in/G) float32, bias (out, in/G) float32, G), or None.
+
+    Affine-binary storage (e.g. FBI-LLM's folded BinaryLinearWscales:
+    bias +/- scale, folded from sign()) holds exactly two values per
+    group of G input positions, with no zero bucket required and the
+    two levels not necessarily symmetric about zero: sign() never emits
+    exact zero, so this shape never overlaps decode_ternary's or
+    decode_group_ternary's {-s, 0, +s} requirement; it only runs once
+    those have already returned None. The largest consistent whole-row
+    group (one scale per output channel, FBI-LLM's 'row' scaling
+    pattern) is tried first, then the same sub-row candidates
+    decode_group_ternary uses. Only row-grouped and per-tensor scaling
+    are detected; a scale varying per input feature across output rows
+    (FBI-LLM's 'column' pattern) is a different storage shape this
+    ladder does not attempt.
+    """
+    if raw.dtype == np.uint8 or raw.ndim != 2:
+        return None
+    x = np.asarray(raw, dtype=np.float32)
+    n_out, n_in = x.shape
+    candidates = (n_in,) + tuple(g for g in groups if g < n_in and n_in % g == 0)
+    for g in candidates:
+        blk = x.reshape(n_out, n_in // g, g)
+        lo = blk.min(axis=2)
+        hi = blk.max(axis=2)
+        if np.any(lo == hi):
+            continue  # a group with only one distinct value isn't binary
+        if np.all((blk == lo[:, :, None]) | (blk == hi[:, :, None])):
+            scale = ((hi - lo) / 2.0).astype(np.float32)
+            bias = ((hi + lo) / 2.0).astype(np.float32)
+            sign = (blk == hi[:, :, None]).astype(np.int8).reshape(n_out, n_in)
+            return sign, scale, bias, g
+    return None
+
+
+def decode_binary_sign_sibling(raw: np.ndarray, wscale: np.ndarray, wbias: np.ndarray
+                               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Decode a latent (never-folded) weight tensor plus its sibling
+    `wscale`/`wbias` tensors into (sign mask int8 {0,1}, scale, bias).
+
+    This is FBI-LLM's actual released convention, confirmed against a
+    real checkpoint (`LiqunMa/FBI-LLM_130M`) -- NOT the folded
+    `decode_binary_affine` pattern originally assumed. The stored
+    `weight` is the continuous training-time latent (every element
+    distinct, never collapsed to two values); the binarization
+    (`sign()`) and the learned affine (`wscale`/`wbias`) are applied at
+    forward time, same as `BinaryLinearWscales.forward` in FBI-LLM's
+    training code. `wscale`/`wbias` are stored shape (1, in_features)
+    -- confirmed on the real checkpoint's asymmetric layers (gate_proj,
+    down_proj) that this is per INPUT FEATURE, broadcast over every
+    output row, not per output channel. That is the *opposite* IR axis
+    from decode_binary_affine's row/per-tensor case: see
+    `WeightTensor.scale_axis` and
+    docs/binary_and_matmulfree_investigation.md.
+
+    Unlike every other decoder in this ladder, there is no pattern to
+    search for: the checkpoint names the affine parameters explicitly
+    (the same sibling-tensor convention as BitNet's `.weight_scale`),
+    so this is a direct read, not an inference. `raw` is not
+    pattern-matched at all -- the caller is responsible for only
+    calling this when the `.wscale`/`.wbias` siblings are present.
+
+    `sign(0)` (raw exactly 0) maps to the low branch (bias-scale); this
+    never occurred on the real checkpoint checked, so it is a
+    documented simplification, not a verified convention.
+    """
+    sign = (np.asarray(raw) >= 0).astype(np.int8)
+    return sign, np.asarray(wscale, dtype=np.float32), np.asarray(wbias, dtype=np.float32)
+
+
 def absmean_quantize(raw: np.ndarray) -> tuple[np.ndarray, float]:
     """The b1.58 inference-time transform for QAT master weights:
     scale = mean|W|, W = clip(round(W / scale), -1, +1)."""
@@ -363,7 +437,10 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
                  ) -> tuple[ModelIR, TransformerArch, dict[str, float]]:
     """Full ternary-weight IR + per-tensor scales from the safetensors
     payload (downloaded via huggingface_hub.snapshot_download, cached in
-    ~/.cache/huggingface/).
+    ~/.cache/huggingface/, unless `repo_id` is already a local directory
+    containing config.json + *.safetensors -- e.g. the output of
+    tools/convert_pickle_checkpoint.py for a release that ships pickle
+    .bin weights, which this function never reads directly).
 
     Every stored tensor goes through the ternary decode ladder (packed
     uint8, then ternary-valued float); a tensor that is neither is kept
@@ -379,20 +456,26 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
     dict means one thing across storage formats.
     """
     import torch
-    from huggingface_hub import snapshot_download
     from safetensors import safe_open
 
     if quantize not in (None, "absmean"):
         raise ValueError(f"unknown quantize mode {quantize!r}")
 
-    snapshot = snapshot_download(
-        repo_id=repo_id,
-        allow_patterns=["*.safetensors", "*.json"],
-    )
-    snapshot_dir = Path(snapshot)
+    local_dir = Path(repo_id)
+    if local_dir.is_dir():
+        snapshot_dir = local_dir
+        arch_name = local_dir.name.replace("-", "_")
+    else:
+        from huggingface_hub import snapshot_download
+        snapshot = snapshot_download(
+            repo_id=repo_id,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
+        snapshot_dir = Path(snapshot)
+        arch_name = repo_id.split("/")[-1].replace("-", "_")
 
     cfg = json.loads((snapshot_dir / "config.json").read_text())
-    arch = parse_hf_config(cfg, name=repo_id.split("/")[-1].replace("-", "_"))
+    arch = parse_hf_config(cfg, name=arch_name)
 
     # Build the IR skeleton; we fill in real weights below.
     model = build_ir_from_arch(arch)
@@ -452,17 +535,44 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
                 raw = t.cpu().numpy()
             else:
                 raw = t.to(dtype=torch.float32).cpu().numpy()
-            decoded = decode_ternary(raw)
+            decoded = None
             group_scale = None
+            group_bias = None
+            scale_axis = "output"
+            scheme = QuantScheme.TERNARY
+            wscale_key = f"{hf_prefix}.wscale"
+            wbias_key = f"{hf_prefix}.wbias"
+            if wscale_key in name_to_file and wbias_key in name_to_file:
+                # FBI-LLM's unfolded BinaryLinearWscales convention (see
+                # decode_binary_sign_sibling): raw is the continuous
+                # latent, not pattern-matched against the usual ladder.
+                with safe_open(name_to_file[wscale_key], framework="pt") as g:
+                    ws = g.get_tensor(wscale_key).to(dtype=torch.float32).cpu().numpy()
+                with safe_open(name_to_file[wbias_key], framework="pt") as g:
+                    wb = g.get_tensor(wbias_key).to(dtype=torch.float32).cpu().numpy()
+                sign, s_sib, b_sib = decode_binary_sign_sibling(raw, ws, wb)
+                decoded = (sign, 1.0)
+                group_scale, group_bias = s_sib.T, b_sib.T   # (in_features, 1)
+                scale_axis = "input"
+                scheme = QuantScheme.BINARY
+            if decoded is None:
+                decoded = decode_ternary(raw)
             if decoded is None:
                 grouped = decode_group_ternary(raw)
                 if grouped is not None:
                     W_g, s_g, _ = grouped
                     decoded, group_scale = (W_g, 1.0), s_g.T        # (input groups, outputs)
+            if decoded is None:
+                binary = decode_binary_affine(raw)
+                if binary is not None:
+                    sign, s_g, b_g, _ = binary
+                    decoded = (sign, 1.0)
+                    group_scale, group_bias = s_g.T, b_g.T          # (input groups, outputs)
+                    scheme = QuantScheme.BINARY
             if decoded is None and quantize == "absmean":
                 decoded = absmean_quantize(raw)
             if decoded is None:
-                why = (f"stored non-ternary ({t.dtype}); pass "
+                why = (f"stored non-ternary, non-binary ({t.dtype}); pass "
                        f"quantize='absmean' if this checkpoint holds "
                        f"QAT master weights")
                 _warn_placeholder(ir_name, why)
@@ -489,8 +599,8 @@ def load_weights(repo_id: str = "microsoft/bitnet-b1.58-2B-4T",
 
         layer = by_name[ir_name]
         layer.weights["weight"] = WeightTensor(
-            name="weight", data=W, scheme=QuantScheme.TERNARY,
-            scale=group_scale,
+            name="weight", data=W, scheme=scheme,
+            scale=group_scale, bias=group_bias, scale_axis=scale_axis,
         )
 
         n_done += 1

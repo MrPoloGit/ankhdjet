@@ -79,6 +79,60 @@ def test_layer_and_tile_emission(tmp_path: Path) -> None:
     assert np.array_equal(load_wmat(r["wmat"]), W)
 
 
+def test_binary_scheme_emits_sign_mapped_mask(tmp_path: Path) -> None:
+    """BINARY tensors sign-map {0,1} -> {-1,+1} and emit through the same
+    .wmat writer as ternary: a binary cell never floats a drain (always
+    BL+ or BL-), a strict subset of the ternary mask vocabulary, so the
+    row/per-tensor granularity case emits without any new cell. The
+    general sub-row group-granularity affine case is a separate,
+    unimplemented concern (see
+    docs/binary_and_matmulfree_investigation.md) -- this only covers the
+    mask-emission mechanics, not that case."""
+    from ankhdjet.backend.macro_grid import emit_layer_grid
+    rng = np.random.default_rng(5)
+    W = rng.choice([0, 1], size=(8, 8)).astype(np.int8)
+    scale = rng.uniform(0.01, 0.05, size=(8,)).astype(np.float32)
+    bias = rng.uniform(-0.1, 0.1, size=(8,)).astype(np.float32)
+    wt = WeightTensor(name="weight", data=W, scheme=QuantScheme.BINARY,
+                      scale=scale, bias=bias)
+    layer = Layer(name="b0", layer_type=LayerType.LINEAR,
+                 weights={"weight": wt}, input_dim=8, output_dim=8)
+
+    p = emit_layer_wmat(layer, tmp_path / "b0.wmat")
+    loaded = load_wmat(p)
+    assert np.array_equal(loaded, W.astype(np.int8) * 2 - 1)
+    assert set(np.unique(loaded).tolist()) == {-1, 1}   # never floats
+
+    man = emit_layer_grid(layer, tmp_path / "grid", macro_rows=8, macro_cols=8)
+    assert man.scheme == "binary"
+    assert man.scale_bias_file == "scale_bias.npz"
+    assert man.scale_axis == "output"
+    npz = np.load(tmp_path / "grid" / "b0" / "scale_bias.npz")
+    assert np.allclose(npz["scale"], scale) and np.allclose(npz["bias"], bias)
+
+
+def test_binary_manifest_records_input_axis(tmp_path: Path) -> None:
+    """A scale_axis="input" tensor (FBI-LLM's real convention: scale/bias
+    per input row, not per output column) round-trips that axis through
+    the manifest -- a consumer reading scale_bias.npz back must not have
+    to guess which axis it applies to."""
+    import json
+    from ankhdjet.backend.macro_grid import emit_layer_grid
+    rng = np.random.default_rng(9)
+    W = rng.choice([0, 1], size=(8, 8)).astype(np.int8)
+    scale = rng.uniform(0.01, 0.05, size=(8, 1)).astype(np.float32)
+    bias = rng.uniform(-0.1, 0.1, size=(8, 1)).astype(np.float32)
+    wt = WeightTensor(name="weight", data=W, scheme=QuantScheme.BINARY,
+                      scale=scale, bias=bias, scale_axis="input")
+    layer = Layer(name="b1", layer_type=LayerType.LINEAR,
+                 weights={"weight": wt}, input_dim=8, output_dim=8)
+
+    man = emit_layer_grid(layer, tmp_path / "grid", macro_rows=8, macro_cols=8)
+    assert man.scale_axis == "input"
+    manifest = json.loads((tmp_path / "grid" / "b1" / "manifest.json").read_text())
+    assert manifest["scale_axis"] == "input"
+
+
 def test_macro_grid_emission(tmp_path: Path) -> None:
     """Grid tiling: ragged edges zero-pad, chunks round-trip to the
     exact layer slice, manifest totals reconcile."""

@@ -54,6 +54,51 @@ def requantize(
     return clipped.astype(np.int64)
 
 
+def requantize_affine(
+    hit: np.ndarray,
+    act_total: int,
+    scale_q: int,
+    bias_q: int,
+    q_frac: int = 8,
+    k_bits: int = 8,
+    activation: str = "relu",
+) -> np.ndarray:
+    """Per-channel affine requantize: the row-granularity affine-binary
+    counterpart of requantize() (see
+    docs/binary_and_matmulfree_investigation.md and
+    rtl/between_layer/requantize_affine.sv):
+
+        product = hit * scale_q + act_total * bias_q
+        shifted = product >>> q_frac
+        out     = clip(activation(shifted), 0, 2^K - 1)
+
+    `hit` is per-channel (array); `act_total` is the one value shared by
+    every channel. `scale_q`/`bias_q` are signed Q(Q_INT.Q_FRAC)
+    fixed-point, scalar or per-channel (array, same shape as `hit`) --
+    a scale of 1.0 is 1 << q_frac; bias is typically small relative to
+    that.
+    """
+    hit = np.asarray(hit, dtype=object)  # big-int safe
+    scale_q = np.asarray(scale_q, dtype=object)
+    bias_q = np.asarray(bias_q, dtype=object)
+    act_total = int(act_total)
+    product = hit * scale_q + act_total * bias_q
+    shifted = np.array(
+        [int(x) >> q_frac for x in product.flatten()], dtype=object
+    ).reshape(hit.shape)
+
+    if activation == "relu":
+        shifted = np.where(shifted < 0, 0, shifted)
+    elif activation == "identity":
+        pass
+    else:
+        raise ValueError(f"unknown activation: {activation}")
+
+    max_val = (1 << k_bits) - 1
+    clipped = np.clip(shifted.astype(np.int64), 0, max_val)
+    return clipped.astype(np.int64)
+
+
 if __name__ == "__main__":
     # Quick self-test
     acc = np.array([1000, -500, 200, 0, 70000], dtype=np.int64)

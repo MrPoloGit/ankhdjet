@@ -55,6 +55,24 @@ def test_content_corruption_caught(tmp_path):
     assert res["failures"] == [("blk_1", "content mismatch vs checkpoint")]
 
 
+def test_binary_scheme_passes_sign_mapped(tmp_path):
+    """BINARY's IR data is {0,1}; the emitted mask is sign-mapped to
+    {-1,+1} (see emit_layer_grid); the audit must compare against
+    W_ref*2-1, not W_ref directly, and skip the floating-drain padding
+    check (every BINARY position is always BL+ or BL-, never
+    floating)."""
+    rng = np.random.default_rng(7)
+    W = rng.integers(0, 2, size=(10, 6)).astype(np.int8)   # padded at 8x4 chunks
+    layer = Layer(name="bin0", layer_type=LayerType.LINEAR,
+                 weights={"weight": WeightTensor(name="weight", data=W,
+                                                 scheme=QuantScheme.BINARY)},
+                 input_dim=10, output_dim=6)
+    model = ModelIR(name="tiny_bin", layers=[layer])
+    emit_model(model, tmp_path, macro_rows=8, macro_cols=4)
+    res = verify_model(model, tmp_path)
+    assert res["ok"] and res["n_ok"] == 1 and res["failures"] == []
+
+
 def test_nonzero_padding_caught(tmp_path):
     model = _emitted(tmp_path)
     # blk.0 is 10x6 at 8x4 chunks: chunk r1_c1 covers rows 8-15, cols

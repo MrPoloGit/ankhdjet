@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from ankhdjet.backend._pool import run_ordered
-from ankhdjet.backend.wmat import emit_wmat
+from ankhdjet.backend.wmat import emit_wmat, save_scale_bias
 from ankhdjet.frontend.ir import Layer, ModelIR, QuantScheme
 
 
@@ -40,17 +40,40 @@ class GridManifest:
     weights: int
     padded_positions: int
     wmat_bytes: int
+    scheme: str = "ternary"
+    scale_bias_file: str | None = None   # set when wt.scale is array-valued
+    scale_axis: str = "output"           # which IR axis scale_bias_file varies along:
+                                          # "output" (per output-column, decode_group_ternary /
+                                          # decode_binary_affine) or "input" (per input-row,
+                                          # decode_binary_sign_sibling -- FBI-LLM's real
+                                          # convention). A consumer must check this, not guess
+                                          # from shape. See
+                                          # docs/binary_and_matmulfree_investigation.md.
 
 
 def emit_layer_grid(layer: Layer, out_dir: Path | str,
                     macro_rows: int = 64, macro_cols: int = 256,
                     write_wmat: bool = True) -> GridManifest:
     """Tile one LINEAR layer into macro chunks and emit their mask
-    programs as `<out_dir>/<layer>/r{i}_c{j}.wmat`."""
+    programs as `<out_dir>/<layer>/r{i}_c{j}.wmat`.
+
+    TERNARY and BINARY both emit: a BINARY cell never floats a drain
+    (every position is BL+ or BL-), which is a strict subset of the
+    ternary mask vocabulary, so BINARY data ({0,1}) is sign-mapped to
+    {-1,+1} and emitted through the same .wmat writer. This covers only
+    the row/per-tensor granularity case a signed-off ternary-cell array
+    can represent as-is; it is not a claim that the general sub-row
+    group-granularity affine case (which needs new per-group
+    periphery) is emittable. See
+    docs/binary_and_matmulfree_investigation.md.
+    """
     wt = layer.weights["weight"]
-    if wt.scheme != QuantScheme.TERNARY:
-        raise ValueError(f"{layer.name}: expected ternary, got {wt.scheme}")
-    W = np.asarray(wt.data, dtype=np.int8)
+    if wt.scheme == QuantScheme.BINARY:
+        W = (np.asarray(wt.data, dtype=np.int8) * 2 - 1)   # {0,1} -> {-1,+1}
+    elif wt.scheme == QuantScheme.TERNARY:
+        W = np.asarray(wt.data, dtype=np.int8)
+    else:
+        raise ValueError(f"{layer.name}: expected ternary or binary, got {wt.scheme}")
     n, m = W.shape
     gr = -(-n // macro_rows)
     gc = -(-m // macro_cols)
@@ -61,7 +84,14 @@ def emit_layer_grid(layer: Layer, out_dir: Path | str,
         r0, r1 = i * macro_rows, min((i + 1) * macro_rows, n)
         for j in range(gc):
             c0, c1 = j * macro_cols, min((j + 1) * macro_cols, m)
-            chunk = np.zeros((macro_rows, macro_cols), dtype=np.int8)
+            # For BINARY, a padded position's '-' is a real, well-defined
+            # cell state (never floating); correctness relies on the
+            # corresponding activation being 0 at padded rows and padded
+            # columns being discarded downstream, same as TERNARY's
+            # zero-weight padding relies on the weight value, not the
+            # cell state, being inert.
+            chunk = np.full((macro_rows, macro_cols), -1 if wt.scheme == QuantScheme.BINARY else 0,
+                           dtype=np.int8)
             chunk[: r1 - r0, : c1 - c0] = W[r0:r1, c0:c1]
             if write_wmat:
                 p = emit_wmat(chunk, out / f"r{i}_c{j}.wmat")
@@ -72,6 +102,8 @@ def emit_layer_grid(layer: Layer, out_dir: Path | str,
                           "ascii") for row in chunk) + b"\n"
             wmat_bytes += len(data)
             chunk_digests[f"r{i}_c{j}"] = hashlib.sha256(data).hexdigest()[:16]
+    out.mkdir(parents=True, exist_ok=True)
+    scale_bias_file = save_scale_bias(wt, out)
     man = GridManifest(
         layer=layer.name, rows=n, cols=m,
         macro_rows=macro_rows, macro_cols=macro_cols,
@@ -79,8 +111,10 @@ def emit_layer_grid(layer: Layer, out_dir: Path | str,
         weights=n * m,
         padded_positions=gr * gc * macro_rows * macro_cols - n * m,
         wmat_bytes=wmat_bytes,
+        scheme=wt.scheme.value,
+        scale_bias_file=scale_bias_file,
+        scale_axis=wt.scale_axis,
     )
-    out.mkdir(parents=True, exist_ok=True)
     (out / "manifest.json").write_text(json.dumps(
         {**asdict(man), "chunks_sha256_16": chunk_digests}, indent=1))
     return man

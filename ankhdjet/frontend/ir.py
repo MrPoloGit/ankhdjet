@@ -5,7 +5,11 @@ to emit mask programs (.wmat chunks with manifests) and the structural
 SystemVerilog that composes the rtl/ library.
 
 The IR is precision-agnostic in principle (the same structures can carry
-INT2/INT4-class cell encodings) but only ternary weights are supported.
+INT2/INT4-class cell encodings). Ternary weights are the only scheme that
+compiles to silicon; BINARY tensors can be decoded and carried through the
+IR (see ankhdjet.frontend.hf.decode_binary_affine) but the backend refuses
+to emit them, since the signed-off bitcell has no encoding for a biased
+two-level weight (see docs/binary_and_matmulfree_investigation.md).
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ class LayerType(Enum):
 
 class QuantScheme(Enum):
     TERNARY = "ternary"  # {-1, 0, +1}
+    BINARY = "binary"    # {0, 1} sign mask; affine levels in scale/bias
     FLOAT = "float"      # unquantized (e.g. scale factors, layernorm params)
 
 
@@ -34,9 +39,21 @@ class QuantScheme(Enum):
 class WeightTensor:
     """One weight matrix with associated quantization metadata."""
     name: str
-    data: np.ndarray                  # raw values: int8 for ternary, float for scales
+    data: np.ndarray                  # raw values: int8 for ternary/binary, float for scales
     scheme: QuantScheme
     scale: np.ndarray | None = None   # per-tensor or per-channel scale factor (float)
+    bias: np.ndarray | None = None    # BINARY only: per-group affine offset (float)
+    scale_axis: str = "output"        # BINARY only: which IR axis scale/bias vary along.
+                                       # "output": per output-column, broadcast over every
+                                       #   input row (decode_binary_affine's row/per-tensor
+                                       #   case -- the periphery-side combine).
+                                       # "input": per input-row (activation index), broadcast
+                                       #   over every output column (FBI-LLM's actual released
+                                       #   convention, confirmed against real weights -- see
+                                       #   docs/binary_and_matmulfree_investigation.md). This
+                                       #   needs an activation-side pre-scale, not a periphery
+                                       #   post-scale; shape and axis must be checked, not
+                                       #   assumed, before consuming scale/bias.
 
     def __post_init__(self):
         if self.scheme == QuantScheme.TERNARY:
@@ -45,6 +62,13 @@ class WeightTensor:
                 raise ValueError(
                     f"Ternary tensor {self.name!r} contains values outside "
                     f"{{-1,0,+1}}: {sorted(vals)}"
+                )
+        elif self.scheme == QuantScheme.BINARY:
+            vals = set(np.unique(self.data).tolist())
+            if not vals.issubset({0, 1}):
+                raise ValueError(
+                    f"Binary tensor {self.name!r} contains values outside "
+                    f"{{0,1}}: {sorted(vals)}"
                 )
 
     @property
@@ -127,10 +151,18 @@ class ModelIR:
                         scale_serial = wt.scale.tolist()
                     else:
                         scale_serial = float(wt.scale)
+                bias_serial = None
+                if wt.bias is not None:
+                    if isinstance(wt.bias, np.ndarray):
+                        bias_serial = wt.bias.tolist()
+                    else:
+                        bias_serial = float(wt.bias)
                 wdefs[wname] = {
                     "array_key": key,
                     "scheme": wt.scheme.value,
                     "scale": scale_serial,
+                    "bias": bias_serial,
+                    "scale_axis": wt.scale_axis,
                 }
             layer_defs.append({
                 "name": layer.name,
@@ -163,10 +195,14 @@ class ModelIR:
                 scale = wdef["scale"]
                 if scale is not None and isinstance(scale, list):
                     scale = np.asarray(scale)
+                bias = wdef.get("bias")
+                if bias is not None and isinstance(bias, list):
+                    bias = np.asarray(bias)
                 weights[wname] = WeightTensor(
                     name=wname, data=data,
                     scheme=QuantScheme(wdef["scheme"]),
-                    scale=scale,
+                    scale=scale, bias=bias,
+                    scale_axis=wdef.get("scale_axis", "output"),
                 )
             layers.append(Layer(
                 name=ldef["name"],

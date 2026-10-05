@@ -41,16 +41,29 @@ def reassemble(layer_dir: Path):
     return full[: man["rows"], : man["cols"]], full, man
 
 
-def verify_layer(layer_dir: Path, W_ref: np.ndarray) -> tuple[str, bool, str]:
+def verify_layer(layer_dir: Path, W_ref: np.ndarray,
+                 scheme: str = "ternary") -> tuple[str, bool, str]:
+    """`scheme` must match the manifest's `scheme` field. BINARY's
+    `W_ref` is the IR's {0,1} sign mask; the emitted mask is sign-mapped
+    to {-1,+1} (see emit_layer_grid), so it is compared against
+    `W_ref*2-1`. BINARY padding is never floating -- every mask-program
+    position is always BL+ or BL- (see
+    docs/binary_and_matmulfree_investigation.md) -- so the "padding is
+    all-zero" check, which only makes sense for TERNARY's floating-drain
+    padding, is skipped for BINARY; padding correctness there is an
+    activation-side invariant (the padded rows are fed zero activation),
+    not a static mask-content one."""
     name = layer_dir.name
     try:
         W, full, man = reassemble(layer_dir)
-        if not np.array_equal(W, W_ref):
+        W_check = W_ref * 2 - 1 if scheme == "binary" else W_ref
+        if not np.array_equal(W, W_check):
             return name, False, "content mismatch vs checkpoint"
-        # padding must be all-zero (floating drains)
-        pad_sum = int(np.abs(full).sum()) - int(np.abs(W_ref).sum())
-        if pad_sum != 0:
-            return name, False, f"nonzero padding ({pad_sum})"
+        if scheme != "binary":
+            # padding must be all-zero (floating drains)
+            pad_sum = int(np.abs(full).sum()) - int(np.abs(W_check).sum())
+            if pad_sum != 0:
+                return name, False, f"nonzero padding ({pad_sum})"
         return name, True, f"{man['n_macros']} macros"
     except Exception as e:  # noqa: BLE001
         return name, False, f"error: {e}"
@@ -64,12 +77,13 @@ def verify_model(model, root: Path, jobs: int = 8,
     root = Path(root)
     model_man = json.loads((root / "model_manifest.json").read_text())
     refs = {l.name: l.weights["weight"].data for l in model.layers}
+    schemes = {l.name: l.weights["weight"].scheme.value for l in model.layers}
     layer_names = [lm["layer"] for lm in model_man["layers"]]
 
     n_ok = 0
     failures: list[tuple[str, str]] = []
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futs = {pool.submit(verify_layer, root / n, refs[n]): n
+        futs = {pool.submit(verify_layer, root / n, refs[n], schemes[n]): n
                 for n in layer_names}
         for k, fut in enumerate(as_completed(futs), 1):
             name, ok, detail = fut.result()

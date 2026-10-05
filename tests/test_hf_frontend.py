@@ -208,6 +208,86 @@ def test_group_scaled_ternary_decodes_with_its_group():
     assert decode_group_ternary(raw[:, :500]) is None                          # no candidate divides the width
 
 
+def test_binary_affine_decodes_per_row():
+    """A tensor whose rows each hold exactly two values bias +/- scale (no
+    zero bucket, FBI-LLM's folded BinaryLinearWscales 'row' pattern) decodes
+    to its sign mask plus one (scale, bias) pair per row; a tensor with a
+    zero bucket (ternary) or three-plus values is left to the ternary
+    ladder/refused, and packed uint8 storage is not this ladder's rung."""
+    from ankhdjet.frontend.hf import decode_binary_affine
+    rng = np.random.default_rng(7)
+    sign = rng.choice([0, 1], size=(6, 512)).astype(np.int8)
+    scale = rng.uniform(0.01, 0.05, size=(6, 1)).astype(np.float32)
+    bias = rng.uniform(-0.2, 0.2, size=(6, 1)).astype(np.float32)
+    raw = np.where(sign == 1, bias + scale, bias - scale).astype(np.float32)
+    out_sign, s, b, g = decode_binary_affine(raw)
+    assert g == 512 and np.array_equal(out_sign, sign)
+    assert np.allclose(s, scale) and np.allclose(b, bias)
+
+    # a tensor with a zero bucket is ternary-shaped, not this ladder's job
+    assert decode_binary_affine(
+        np.array([[-0.5, 0.0, 0.5]], dtype=np.float32)) is None
+    # noise has more than two values per row
+    assert decode_binary_affine(rng.normal(size=(6, 512)).astype(np.float32)) is None
+    # packed storage belongs to the ternary uint8 rung
+    assert decode_binary_affine(_pack(np.ones((4, 8), dtype=np.int8))) is None
+
+
+def test_binary_affine_decodes_sub_row_groups():
+    """A per-group (not whole-row) affine scale/bias is found at its own
+    group size, same as decode_group_ternary's largest-consistent-candidate
+    search."""
+    from ankhdjet.frontend.hf import decode_binary_affine
+    rng = np.random.default_rng(11)
+    sign = rng.choice([0, 1], size=(4, 256)).astype(np.int8)
+    scale = rng.uniform(0.01, 0.05, size=(4, 2)).astype(np.float32)
+    bias = rng.uniform(-0.2, 0.2, size=(4, 2)).astype(np.float32)
+    lo = np.repeat(bias - scale, 128, axis=1)
+    hi = np.repeat(bias + scale, 128, axis=1)
+    raw = np.where(sign == 1, hi, lo).astype(np.float32)
+    out_sign, s, b, g = decode_binary_affine(raw)
+    assert g == 128 and s.shape == (4, 2)
+    assert np.array_equal(out_sign, sign)
+    assert np.allclose(s, scale) and np.allclose(b, bias)
+
+
+def test_binary_sign_sibling_decodes_latent_weight():
+    """FBI-LLM's actual released convention (confirmed against a real
+    LiqunMa/FBI-LLM_130M checkpoint -- see
+    docs/binary_and_matmulfree_investigation.md): `weight` is the
+    continuous, never-folded training latent (every element distinct),
+    and the real effective weight is wscale*sign(weight)+wbias with
+    wscale/wbias broadcast per INPUT FEATURE (one value per column of
+    the stored (out, in) tensor, shared across every output row) --
+    the opposite IR axis from decode_binary_affine's row/per-tensor
+    case. This decoder does no pattern search: it is a direct read."""
+    from ankhdjet.frontend.hf import decode_binary_sign_sibling
+    rng = np.random.default_rng(3)
+    out_f, in_f = 24, 16
+    latent = rng.normal(size=(out_f, in_f)).astype(np.float32)  # never collapses to 2 values
+    wscale = rng.uniform(0.01, 0.05, size=(1, in_f)).astype(np.float32)
+    wbias = rng.uniform(-0.1, 0.1, size=(1, in_f)).astype(np.float32)
+
+    sign, s, b = decode_binary_sign_sibling(latent, wscale, wbias)
+    assert sign.shape == latent.shape
+    assert set(np.unique(sign).tolist()).issubset({0, 1})
+    assert np.array_equal(s, wscale) and np.array_equal(b, wbias)
+
+    w_eff_direct = wscale * np.sign(latent) + wbias
+    w_eff_decoded = b + (sign.astype(np.float32) * 2 - 1) * s
+    assert np.allclose(w_eff_direct, w_eff_decoded)
+    # column-wise granularity: every column collapses to exactly 2 values
+    for c in range(in_f):
+        assert np.unique(w_eff_decoded[:, c]).size == 2
+
+    # the raw latent (many distinct values per row/column) correctly
+    # fails every pattern-search decoder -- there is nothing to find
+    assert decode_ternary(latent) is None
+    from ankhdjet.frontend.hf import decode_binary_affine, decode_group_ternary
+    assert decode_group_ternary(latent) is None
+    assert decode_binary_affine(latent) is None
+
+
 def test_group_scaled_real_row_from_the_qwen36_release():
     """A real k_proj row of a group-scaled ternary release, if its checkpoint
     tensor was fetched into the scratchpad, decodes at group 128."""
