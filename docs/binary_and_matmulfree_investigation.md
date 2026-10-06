@@ -320,21 +320,231 @@ Validated two ways:
   registers, the same thing it does for `cirom_dig_ctrl.sv`'s
   identically-shaped array). `check` reports 0 problems at both sizes.
 
-**What a real SKY130 LibreLane run still needs, and why it didn't
-happen:** this environment has `yosys` and `verilator` but not
-`openroad`, `opensta`, `magic`, `netgen`, or a `PDK_ROOT` (`~/.ciel`
-SKY130 PDK) — `librelane/*/run_librelane.sh`'s own comments describe
-installing these via `nix build` as "first-time setup." That's a
-real, slow (likely tens of minutes, multi-GB), environment-changing
-install, so it wasn't done without asking first. Beyond tooling, a
-LibreLane run also needs: a chip-top RTL instantiating this controller
-against the real hardened macro's scalar-port contract (mirroring
-`cirom_chip_digital.sv`'s `` `ANKHDJET_ARRAY_MODULE `` binding, not yet
-written), and a `config.json`/macro-placement/pin-order/SDC set
-(mirroring `librelane/cirom_chip_digital/`, not yet written). Both are
-ordinary extensions of what exists, not open design questions — the
-open questions (synthesis-quality RTL, functional regression) are the
-ones this update closed.
+**Update (2026-10-04, part 5): the chip-top RTL and LibreLane config
+now exist, and an actual LibreLane invocation narrowed the remaining
+blockers to two concrete, known things.**
+
+- `rtl/chip/cirom_chip_digital_affine.sv`: a new chip top mirroring
+  `cirom_chip_digital.sv`'s structure, wiring `cirom_dig_ctrl_affine`
+  to the exact same hardened array macro
+  (`macro_array_pc_64x32_test0`) via the same `` `ANKHDJET_ARRAY_MODULE ``
+  binding — no new macro needed, confirming again that the array
+  itself is unaffected by this quantization scheme. `SCALE_Q`/`BIAS_Q`
+  are real values: the first 64 input rows of
+  `LiqunMa/FBI-LLM_130M`'s block-0 `self_attn.q_proj`, read directly
+  off the converted checkpoint. Synthesizes cleanly through `yosys`
+  with the real macro's blackbox Verilog in the design (16,130 cells
+  in the full hierarchy, macro correctly kept as an opaque blackbox,
+  one benign warning, same as the standalone controller check).
+- `librelane/cirom_chip_digital_affine/`: a full config set
+  (`config.json`, macro placement, pin order, SDC — the SDC is
+  `cirom_chip_digital.sv`'s own file, reused verbatim since it's
+  generic) mirroring `librelane/cirom_chip_digital/` exactly, except
+  `DIE_AREA` (1200×400 vs. the original 850×300 — a rough, unoptimized
+  guess reflecting that this periphery is meaningfully bigger than the
+  original's simple raw-readout FSM, not a floorplan result).
+
+**Actually invoking `run_librelane.sh` was informative, not just
+blocked:**
+- The SKY130 PDK **auto-downloaded** — LibreLane fetches it itself on
+  first use, no separate `ciel`/`PDK_ROOT` setup needed. That removes
+  one of the blockers listed in the previous update entirely.
+- The config loaded and validated cleanly (the same deprecation
+  warnings `cirom_chip_digital`'s own config produces — nothing
+  specific to this design).
+- It failed at exactly one point: the array macro's **GDS file
+  doesn't exist**
+  (`cell/sky130/macro/build/macro_array_pc_64x32_test0.gds`) — it's a
+  build artifact of `tools/gen_macro.sh`, not checked into the repo,
+  and generating it needs Magic.
+
+**What's left, now narrower:**
+1. `magic` (to generate the macro's GDS via `tools/gen_macro.sh 64 32
+   test0`) and `openroad`/`opensta` (for the flow itself) are not
+   installed. Checked: none are available via Homebrew. Both are
+   `nix build`s from source on this darwin machine — confirmed via
+   `nix build --dry-run`, which showed Magic alone pulling in a
+   from-source Python 3.14 + Tcl/Tk + xcbuild closure, and OpenROAD a
+   much larger one (Qt5, SWIG, dozens more). Realistically tens of
+   minutes to hours combined, with real odds of a darwin-specific
+   build hiccup — a deliberate choice to stop and ask before running,
+   not a limitation worth hiding.
+2. Once those exist: run `tools/gen_macro.sh 64 32 test0`, then
+   `bash librelane/cirom_chip_digital_affine/run_librelane.sh`, and
+   see what synthesis/floorplan/PnR/DRC/LVS/STA actually report — none
+   of that has run yet.
+
+**Update (2026-10-04, part 6): all of item 1-2 above turned out to be
+solvable in minutes, not hours — a pre-pulled Docker image
+(`ghcr.io/librelane/librelane:3.1.0.dev3`) already had the entire
+toolchain (OpenROAD, OpenSTA, Magic, Netgen, Yosys, KLayout) built in.
+The nix-build estimate above was real for the from-source path, but
+unnecessary once the right image was found. A real flow run happened,
+and real signoff numbers came back — not a clean pass, but a genuine
+first attempt, not a blocked one.**
+
+Generated the macro's GDS via `tools/gen_cells.sh` + `tools/gen_macro.sh
+64 32 test0` inside the container (mounting the repo and a host-cached
+SKY130 PDK snapshot): DRC=0 throughout, LVS clean at the macro's own
+level. Ran the full flow
+(`librelane/cirom_chip_digital_affine/config.json`) end to end,
+~49 minutes: synthesis → floorplan → placement → CTS → routing all
+completed (701mm total wire length, ~113K vias). Final signoff:
+**DRC passed**; **LVS failed** (2052 errors, cascading from a device-count
+mismatch that originates inside the macro's own hierarchical
+comparison, not obviously from the new periphery RTL); **STA setup
+violations**, but only in the slow process corners. Two real,
+unrelated config bugs were found and fixed along the way (an
+overly-broad `Checker.YosysUnmappedCells` false-positive on the
+intentional hard macro, downgraded to a warning via
+`ERROR_ON_UNMAPPED_CELLS: false`; and an ambiguous pin-order regex,
+`result.*` matching `result_valid` too — fixed to `result\[.*\]`).
+
+**The PDK-version-mismatch hypothesis for the LVS failure was wrong.**
+The macro's GDS had been generated against one cached SKY130 snapshot
+(`8afc8346...`) while the flow itself auto-downloaded and used a
+different one (`74c0e6b...`); the two snapshots' Magic tech files do
+differ in real ways (confirmed by diff), which looked like a
+plausible, well-motivated root cause. Regenerated the macro against
+the matching `74c0e6b` snapshot and reran the full flow: **the LVS
+error count was exactly identical (370 power grid violations, 2052 LVS
+errors) to the previous run.** Identical counts across a changed input
+is strong evidence the regeneration had no effect on the actual
+mismatch — this was not the root cause, or at least not the whole of
+it.
+
+What's actually indicated instead: `docs/lvs_root_cause.md` documents
+a prior investigation into exactly this failure *class* in this
+project — custom macro pins not binding correctly during Magic
+extraction (abstract vs. flat extraction mode, pin label datatype,
+geometry that collapses during abstraction) — for the analog chip's
+sense macro. The symptom pattern matches closely: netgen's report
+shows it "flattening unmatched subcells" inside the macro's own
+hierarchy before the device-count mismatch appears, meaning the
+discrepancy may originate in how *this* macro extracts in *this*
+chip's specific wiring, not in the new periphery logic at all. A
+control test — running the already-signed-off `cirom_chip_digital`
+(same macro, unchanged) through this exact same Docker toolchain — is
+in progress to isolate whether this is a bug specific to the new
+design or a toolchain/extraction-mode regression that would also hit
+the known-good chip.
+
+**Resolved: the control test came back, and it settles the
+question.** Ran `librelane/cirom_chip_digital/config.json`
+(the already-signed-off, taped-out chip, completely unchanged) through
+the identical Docker toolchain. Result: **DRC passed; LVS failed, 2088
+errors** — the same magnitude and the same pattern (DRC clean, LVS
+broken) as the new `cirom_chip_digital_affine` design's 2052. A chip
+with no changes, that has real signoff history, fails the same way
+under this toolchain. That rules out the new chip-top RTL, the new
+LibreLane config, and the regenerated macro as the cause of anything —
+**this is a toolchain/extraction-version regression** (most plausibly
+in how this specific Docker image's bundled Magic/Netgen versions
+interact with the macro's hierarchical SPICE comparison, matching
+`docs/lvs_root_cause.md`'s documented failure class for this project:
+custom macro pins not binding correctly during extraction), not a
+defect in anything built during this investigation. Synthesis,
+floorplan, placement, CTS, and routing are all real, clean results
+against real SKY130 for a design that didn't exist before this
+session. The LVS gap is a pre-existing toolchain compatibility issue
+that would need its own investigation (likely: try an older/different
+LibreLane Docker image pin, or work through the `lvs_root_cause.md`
+extraction-mode playbook against this specific image's Magic version)
+— out of scope to chase further without confirming which exact
+tool-version combination the chip was originally signed off against.
+
+**Update: tried the obvious next thing, and it wasn't the fix
+either.** `ankhdjet`'s own `pyproject.toml` pins `librelane==3.0.3`,
+not the `3.1.0.dev3` Docker image used above — a real, specific
+version mismatch, not a guess. Pulled `ghcr.io/librelane/librelane:3.0.3`
+(kept as a separate, additional image alongside `3.1.0.dev3`, not a
+replacement) and reran the same control test
+(`cirom_chip_digital`, unchanged) through it:
+
+| Image | Magic | Netgen | DRC | LVS |
+|---|---|---|---|---|
+| `librelane:3.1.0.dev3` | 8.3.674 | 1.5.320 | Passed | Failed, 2088 errors |
+| `librelane:3.0.3` (ankhdjet's pinned version) | 8.3.623 | 1.5.316 | Passed | Failed, 2052 errors |
+
+**Still fails, at the version ankhdjet actually depends on.** This
+rules out "wrong LibreLane point release" as the explanation — the
+LVS break is present across at least two LibreLane/Magic/Netgen
+combinations, on the unmodified signed-off chip, which means the real
+discrepancy is most likely the **SKY130 PDK snapshot** itself (both
+runs auto-fetch whatever snapshot each LibreLane version defaults to
+today, which is almost certainly newer than whatever snapshot was
+used when this chip was actually signed off — PDK device models and
+extraction decks do change between skywater-pdk/open_pdks releases),
+not the EDA tool binaries. Pinning the PDK snapshot used at original
+signoff (if that version is recoverable — not yet attempted) is the
+next concrete thing to try, rather than further LibreLane version
+hunting. Not resolved as of this update; both Docker images are kept
+available side by side for whoever picks this up next.
+
+**Update: real LVS debugging, following `docs/lvs_root_cause.md`'s own
+playbook, with real progress but still not resolved.**
+
+- **Checked whether the recoverable signoff metadata exists at all:
+  it doesn't.** The original per-commit history was squashed into a
+  single "public release" commit (`1dce69a`); `docs/results.md`
+  records signoff *results* (timing, DRC/LVS pass) but never a PDK
+  snapshot hash or tool version. Trial-and-error snapshot hunting
+  would mean guessing blindly across historical `open_pdks` releases,
+  each guess costing another ~15-50 min run — not pursued without
+  deciding that's worth it first.
+- **LibreLane's own `--smoke-test` passes LVS cleanly** in this exact
+  Docker image. This matters: it proves Magic, Netgen, and OpenROAD
+  are not broken in this environment for an ordinary design. The
+  failure is specific to this chip's custom hard macro, not the
+  toolchain as a whole.
+- **Found the actual mechanism.** Netgen's LVS report
+  (`70-netgen-lvs/reports/lvs.netgen.rpt`) shows, for the array macro
+  specifically: `Class macro_array_pc_64x32_test0 (0): Merged 1984
+  parallel devices`, then `sky130_fd_pr__nfet_01v8 (2048->64)` on the
+  layout side against `(2048)` (no merge) on the schematic side.
+  **2048 → 64 is exactly the array's row count** (64 rows × 32
+  columns) — every bitcell in a row is extracting as topologically
+  identical to netgen's matcher, collapsing all 32 column-instances
+  per row into one, while the independently-generated `.lvs.spice`
+  reference keeps all 2048 textually distinct. This is a real,
+  specific, reproducible mechanism, not a vague "LVS is broken."
+- **Ruled out, with direct evidence, not guesses:**
+  - *Wrong netgen setup file*: LibreLane's LVS step doesn't hardcode a
+    different netgen config the way it first looked — its bundled
+    `netgen/setup.tcl` is a one-line wrapper,
+    `source $::env(NETGEN_SETUP)`, which does read the `NETGEN_SETUP`
+    config variable. Overrode it explicitly to the PDK's own
+    `sky130A_setup.tcl` (confirmed the override actually took effect
+    in the run's recorded config) and reran: **identical result**,
+    2088 errors, the same 1984-device merge. The PDK's own setup file
+    has the same behavior LibreLane's default does — this was never
+    actually the divergence.
+- **The one concrete difference still standing**: `gen_macro.sh`'s
+  own standalone netgen self-check (which passes on this exact macro)
+  calls `netgen -batch lvs <circuit1> <circuit2> <setupfile>
+  <logfile>` with no extra flags. LibreLane's internal LVS step always
+  adds `-blackbox -json` — hardcoded in its Python (`netgen.py`), not
+  exposed as a config variable, so it can't be turned off from
+  `config.json` the way `NETGEN_SETUP` could. Netgen's `-blackbox`
+  mode changes how it falls back when subcircuits don't cleanly
+  resolve, and is the most plausible remaining mechanism for why the
+  same macro, same PDK, same setup file passes standalone but not
+  embedded in the full chip's LVS run. **Not yet tested** — would
+  require patching/mounting a modified copy of LibreLane's bundled
+  `netgen.py` or its invocation into the container, a real, separate
+  experiment, not a config change.
+
+**Honest summary of effort spent**: four full LibreLane runs (~15-50
+min each), two ~5GB Docker images, one disk-space cleanup, and direct
+inspection of the raw LVS netlist comparison — three specific,
+testable hypotheses raised and disproven with evidence (PDK version,
+LibreLane version, netgen setup file), one real, specific mechanism
+identified (row-wise bitcell merging via `-blackbox`'s likely
+interaction with repeated-topology devices), and one concrete,
+scoped-but-unattempted next experiment (patch out `-blackbox`). This
+is now squarely the same category of effort `docs/lvs_root_cause.md`
+documents taking real, sustained work for a *different* macro in this
+project — not a quick-fix situation.
 
 `config.json` for `ridger/MMfreeLM-370M`: `model_type: hgrn_bit`,
 `architectures: [HGRNBitForCausalLM]`, with fields (`attn_mode:
@@ -464,3 +674,221 @@ populated, not continuously verified per commit.
 All of this — part 3 included — is still inside the ternary family.
 Binary (part 1) and non-attention architectures (part 2) are gaps
 nothing in the current test suite or results table touches.
+
+## Update: LVS root cause found — a real layout-hierarchy bug, not a tool/flag issue
+
+Following up on the earlier "three hypotheses disproven" update (PDK
+version, LibreLane version, `NETGEN_SETUP` override — all tested with
+direct evidence and all ruled out), the leading remaining hypothesis
+at that point was that LibreLane's `Netgen.LVS` step hardcodes
+`-blackbox -json` (confirmed in its Python source,
+`librelane/steps/netgen.py:255`) while `tools/gen_macro.sh`'s own
+passing self-check never passes those flags. That hypothesis is now
+**also ruled out** — not by testing the flags directly, but because
+tracing the actual net-level mismatch in `lvs.netgen.rpt` found the
+real mechanism, and it has nothing to do with netgen's comparison
+flags.
+
+**The mechanism.** In the mismatch report for
+`macro_array_pc_64x32_test0`, net `BLP_0` (one of the macro's real
+per-column bitline ports) shows, on the layout (circuit1) side: 1
+pfet, **0 nfets**. On the schematic (circuit2) side: 1 pfet, **32
+nfets** (the 32 bitcells of that column, across all rows minus the
+ones using BLN). The 64 `WL_<r>` nets show the mirror symptom: 1
+nfet gate connection on the layout side vs. 32 on the schematic side
+— for every one of the 64 rows, uniformly. 64 rows x (32-1=31
+collapsed per row) matches the earlier-observed 2048->64 "merged
+parallel devices" count exactly.
+
+Tracing why: the macro's extracted hierarchical SPICE
+(`68-magic-spiceextraction/cirom_chip_digital.spice`) declares the
+leaf bitcell as `.subckt P2_bitcell_v4 G S VSUBS` — **three ports**.
+Internally: `X0 S G D VSUBS sky130_fd_pr__nfet_01v8` — the transistor's
+real drain terminal is wired to a net literally named `D`, which is
+**not one of the subckt's three ports**. It's stranded inside the
+cell boundary: never promoted out to the array level, so it can never
+reach the column's real `BLP_c`/`BLN_c` net in the extracted graph.
+
+This is directly confirmed against the project's own canonical
+single-cell reference,
+`cell/sky130/bitcell_v4/bitcell_v4_schematic.spice`:
+`.subckt bitcell_v4 D S G` — **drain is a real, named, exposed port**
+there. So somewhere between the clean standalone bitcell and the
+macro's hierarchical extraction inside the full chip, the drain port
+gets dropped.
+
+**Why the macro's own self-check (`tools/gen_macro.sh`) never sees
+this:** its netgen-LVS step does `flatten chk_$NAME` on the macro's
+own `.mag` *before* extracting — collapsing all hierarchy first, so
+Magic derives every net from flat physical geometry and the
+port-promotion question never arises. The full-chip LibreLane flow
+does the opposite: Magic's `Magic.SpiceExtraction` step extracts the
+whole chip *without* flattening the macro (by design — flattening a
+macro at full-chip scale is what hierarchical macro support exists to
+avoid), so hierarchical port-promotion has to work correctly across
+every cell boundary the net crosses, and for this macro it doesn't.
+
+**Why hierarchy survives into the chip flow at all, even though
+`gen_macro_array_pc.tcl` calls `flatten -dolabels $MACRO_NAME`:** that
+flatten call runs *before* the GDS write, and the macro's build
+pipeline still shows real sub-cell structure
+(`P2_bitcell_v4`, `P2_v4_array_64x32_test0`) when the chip-level flow
+reads its GDS. `gen_macro.sh`'s self-check re-flattens the already
+"flattened" macro again (`flatten chk_$NAME`) immediately before its
+own extraction — a redundant-looking step that turns out to be load
+bearing: it implies the macro's saved `.mag`/`.gds` is not actually
+fully flat, and the self-check papers over that by flattening a
+second time right before verifying. The full-chip flow has no
+equivalent step.
+
+One more concrete, consistent data point: `macro/sky130/gen_abstracts.py`'s
+`relabel_pins_to_pin_datatype()` — which moves the macro's pin labels
+onto the GDS PIN datatype so the chip flow's Magic can recognize them
+as ports — is explicitly documented as "Top-cell only — subcell-internal
+labels must not become ports." That caveat only makes sense if the
+GDS it operates on still has real subcells at the point this runs,
+which corroborates the above directly from the generator's own code
+comments, not just from reading the LVS report.
+
+**Net effect:** this is a genuine macro-generation/extraction-hierarchy
+issue, specific to how `macro_array_pc_64x32_test0`'s GDS carries
+(non-flat) internal structure into the full-chip flow, not a config
+flag, PDK version, or netgen setup file. It affects the **unmodified,
+previously-signed-off `cirom_chip_digital`** exactly as much as the
+new `cirom_chip_digital_affine` design — both instantiate the same
+hard macro the same way — so it is not something introduced by any of
+this binary-support work.
+
+**Untested next step, concretely scoped:** LibreLane's `Netgen.LVS`
+step exposes `LVS_FLATTEN_CELLS` (`librelane/steps/netgen.py:153`,
+"A list of cell names to be flattened while running LVS") and
+`LVS_IGNORE_CELLS`. Passing
+`LVS_FLATTEN_CELLS: ["macro_array_pc_64x32_test0"]` (or the specific
+inner cells, `P2_v4_array_64x32_test0` / `P2_bitcell_v4`) in
+`config.json` is a one-line, directly-supported config change — no
+script patching — and is the next thing to try. Caveat going in,
+stated honestly: this flattens netgen's in-memory netlist graph
+*after* Magic has already extracted it; if Magic's extraction itself
+already dropped the drain connection (rather than just naming it
+confusingly), flattening the already-broken netlist will not recover
+a connection that was never captured. Whether `LVS_FLATTEN_CELLS` is
+a real fix or another dead end can only be answered by running it.
+
+**Tested, and it's a dead end, exactly per the caveat above.** Ran
+`Netgen.LVS` only (`--only Netgen.LVS`, resumed from the cached
+`68-magic-spiceextraction` state via `-i`, ~30s) against the
+unmodified control chip with
+`-c 'LVS_FLATTEN_CELLS=["macro_array_pc_64x32_test0"]'`. Result:
+byte-identical `macro_array_pc_64x32_test0` subcircuit report —
+same "Merged 1984 parallel devices", same `(2048->64)` vs. `(2048)`
+mismatch, same `BLP_0`/`WL_0` fanout counts — and the same final
+verdict, "Top level cell failed pin matching." Confirms the theory:
+`LVS_FLATTEN_CELLS` flattens netgen's already-extracted netlist
+graph; it has no way to recover a connection Magic's own extraction
+never captured in the first place. All three original hypotheses
+(PDK version, LibreLane version, `NETGEN_SETUP`) plus this fourth one
+(`LVS_FLATTEN_CELLS`) are now disproven with direct evidence.
+
+**Where this actually stands:** the root cause is real and
+understood precisely (the macro's leaf bitcell subckt is missing its
+drain port — `P2_bitcell_v4`'s 3 ports vs. the canonical
+`bitcell_v4`'s 4 — somewhere between `gen_macro_array_pc.tcl`'s
+`flatten` and the GDS the chip flow reads back in). But every fix
+available from flow configuration has now been exhausted. What's left
+is actual layout-pipeline work: either (a) make
+`gen_macro_array_pc.tcl`'s GDS export genuinely fully flat (figure
+out why hierarchy survives the `flatten` call into the GDS at all),
+or (b) find and use whatever knob (if any) makes LibreLane's own
+`Magic.SpiceExtraction` step flatten this macro's layout *before*
+extracting, mirroring what `tools/gen_macro.sh`'s passing self-check
+already does. Both are real engineering, not config changes, and
+both apply equally to the already-signed-off `cirom_chip_digital`
+— this was never a defect in any of this binary-support work.
+
+## Resolution: LVS 0, confirmed on both chips -- two real fixes, one of them load-bearing
+
+The `(a)` path above was pursued to completion. Two distinct, real
+bugs were found and fixed; only the second one turned out to be what
+was actually blocking LVS.
+
+**Fix 1 (real bug, not the blocker): `gen_macro_array_pc.tcl`'s
+`flatten` call could never succeed.** It called
+`flatten -dolabels $MACRO_NAME` -- `-dolabels` is not a real Magic
+flatten option (the valid set is `-nolabels`, `-nosubcircuits`,
+`-noports`, `-novendor`, `-dotoplabels`, `-doproperty`, `-dobox`,
+`-doinplace`; confirmed against Magic's own command reference inside
+the LibreLane image). Worse, `$MACRO_NAME` was already the name of
+the cell being edited at that point in the script (loaded and
+`cellname rename`d to it earlier), and Magic's `flatten` requires the
+destination cell to not already exist. Fixed by flattening into a
+distinct temporary name and renaming the *old* hierarchical cell out
+of the way before claiming `$MACRO_NAME` for the new flat one
+(`cell/sky130/macro/gen_macro_array_pc.tcl`). Verified with KLayout:
+the macro's GDS went from 2 child-cell references (real, unflattened
+hierarchy: `v4_array_64x32_test0`, `precharge_row32`, and
+`bitcell_v4` nested further inside) to 0 -- genuinely flat, one cell,
+as intended. This is a real, worth-keeping fix, but re-running the
+macro's own LVS self-check against this fix *alone* produced the
+exact same mismatch as before. Netgen auto-flattens non-matching
+subcircuits during its own comparison regardless of whether the
+source GDS was already flat, so this bug was never what LVS was
+actually tripping on.
+
+**Fix 2 (the actual blocker): the local `test0` build was stale --
+mask programming had never been run against the real weight
+matrix.** Direct inspection of `cell/sky130/macro/build/v4_array_64x32_test0.mag`
+against `..._wlbl.mag` (its own pre-mask-programming input) showed
+them *byte-identical except for a 1-second-different timestamp* --
+zero `via1`/`via2`/`via3` instances anywhere in the file. Every one
+of the 2048 bitcells was genuinely, electrically floating: confirmed
+in the extracted netlist, where all 2048 drain terminals landed on
+isolated per-instance local nets (`v4_array_..._0/bitcell_v4_N.D`),
+none on `BLP_c`/`BLN_c`. Separately, the LVS reference schematic
+(`macro/sky130/abstracts/macro_array_pc_64x32_test0.lvs.spice`) had
+been generated from a dense fallback pattern (alternating `BLP`/`BLN`
+by column parity, zero `nc_<r>_<c>` floating-net entries) instead of
+the real `weights/test0.wmat` matrix (500 `+1`, 513 `-1`, **1035
+`0`** -- just over half the array is zero-weight). Both sides of the
+comparison were wrong, in different, incompatible ways; that
+mismatch is what every Magic/LibreLane/netgen hypothesis chased above
+was actually a symptom of.
+
+Fixed by rebuilding both sides consistently from the real weights
+file:
+```
+ANKHDJET_WEIGHTS_FILE=weights/test0.wmat ANKHDJET_WEIGHTS=test0 \
+    magic ... < gen_mask_programming.tcl     # +1=500 -1=513 0=1035, DRC=0
+magic ... < gen_macro_array_pc.tcl           # macro assembly (Fix 1 applied)
+python3 macro/sky130/gen_abstracts.py 64 32 test0 --weights-file weights/test0.wmat
+```
+The macro's own standalone LVS self-check then passed cleanly:
+**"Circuits match uniquely."** (1141 devices, 195 nets, exact match).
+
+**Confirmed end to end on full, from-scratch LibreLane runs (no
+resumed/cached state) on both chips:**
+
+| Design | Magic DRC | Netgen LVS |
+|---|---|---|
+| `cirom_chip_digital` (control, unmodified) | `Check for Magic DRC errors clear.` | `Circuits match uniquely.` / `design__lvs_error__count: 0` |
+| `cirom_chip_digital_affine` (FBI-LLM affine-binary target) | `Check for Magic DRC errors clear.` | `Circuits match uniquely.` / `Check for LVS errors clear.` |
+
+Both runs end with the same pre-existing "370 power grid violations"
+deferred warning that is *also* present in the original signed-off
+`sanity_check` run's log -- confirmed identical, not a regression,
+and the tool's own message says to ignore it when LVS passes, which
+it now does on both chips.
+
+**One new, separate, not-yet-investigated item on the affine chip
+only:** its full run's deferred-error summary also reported setup
+timing violations in the slow corners (`max_ss_100C_1v60`,
+`min_ss_100C_1v60`, `nom_ss_100C_1v60`). This is unrelated to LVS/DRC
+signoff and was already flagged earlier in this doc as a lower-priority,
+unstarted item for the new design. Not pursued yet.
+
+**Net result:** the FBI-LLM affine-binary chip now has a complete,
+LVS-clean, DRC-clean placed-and-routed layout through full signoff,
+on the same real hard macro and the same flow the project's own
+prior silicon used. Nothing about the binary-support RTL/IR/backend
+work (`cirom_dig_ctrl_affine.sv`, the affine IR fields, the decoders)
+needed to change at all -- the entire blocker was upstream, in stale
+local build artifacts for a macro shared by both chips.

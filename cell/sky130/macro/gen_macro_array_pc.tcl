@@ -410,13 +410,34 @@ port make
 # Magic's tile-engine doesn't fire spurious met2.1 at subcell-
 # boundary M2 polygons. KLayout's geometric DRC sees no narrow M2
 # either way, but flattening keeps Magic+KLayout in agreement.
-# -dolabels keeps existing top-level labels (VPWR) in the flattened
-# cell. Pin labels for BL+/BL-/WL are added BELOW the flatten
-# because the underlying M1/M2/M3 layers come from the bitcell array
-# subcell -- before flatten, paint at those positions doesn't bind
-# to the right layer at the macro top level.
-flatten -dolabels $MACRO_NAME
-load $MACRO_NAME -quiet
+# Pin labels for BL+/BL-/WL are added BELOW the flatten because the
+# underlying M1/M2/M3 layers come from the bitcell array subcell --
+# before flatten, paint at those positions doesn't bind to the right
+# layer at the macro top level.
+#
+# `flatten` must target a cell name that is NOT the one currently
+# being edited: $MACRO_NAME was already created and loaded above
+# (line ~78, `load $MACRO_NAME -quiet` + `cellname rename`), so
+# `flatten $MACRO_NAME` here would be asking Magic to flatten the
+# current edit cell into a destination of the SAME name -- Magic's
+# own flatten requires the destination to not already exist (see
+# `flatten` in the Magic command reference), so this failed silently
+# and left the macro's saved .mag/.gds genuinely unflattened (real
+# sub-cell hierarchy -- v4_array_*, bitcell_v4 -- survives into any
+# downstream flow that reads this GDS hierarchically instead of via
+# LEF abstraction, e.g. the full-chip LVS extraction step). Also
+# dropped the nonexistent `-dolabels` flag (not a real Magic flatten
+# option; the actual label-copying behavior it was reaching for is
+# already the default -- only `-nolabels` turns it off).
+set FLAT_NAME "${MACRO_NAME}_flat"
+flatten $FLAT_NAME
+load $FLAT_NAME -quiet
+# $MACRO_NAME (the pre-flatten hierarchical cell) is still loaded in
+# the database under its own name -- rename it out of the way before
+# claiming that name for the flattened cell, or the rename below
+# fails with "that cell already exists".
+cellname rename $MACRO_NAME "${MACRO_NAME}_prehierarchy"
+cellname rename $FLAT_NAME $MACRO_NAME
 select top cell
 
 # Top-level pin labels (post-flatten). Each BL+/BL- M2/M3 strip and

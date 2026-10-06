@@ -1,3 +1,4 @@
+.DS_Store
 __pycache__/
 *.pyc
 .venv/
@@ -19,3 +20,4 @@ librelane/tt_digital/build/
 librelane/tt_analog/*_console.log
 librelane/tt_digital/*_console.log
 librelane/cirom_chip_digital/runs/
+.scratch_lvs/
